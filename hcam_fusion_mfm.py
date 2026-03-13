@@ -9,7 +9,6 @@ from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 import copy
 import warnings
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -20,13 +19,12 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-
 FACE_FEATURE_DIR       = "/kaggle/input/datasets/wawuwaa/vi-feature-groupemow/Vi_Feature_GroupEmoW/facial_features_groupemow_dinov2_small"
 OBJECT_FEATURE_DIR     = "/kaggle/input/datasets/wawuwaa/vi-feature-groupemow/Vi_Feature_GroupEmoW/Object_Features_GroupEmoW_dinov2_small"
-SCENE_FEATURE_DIR      = "/kaggle/input/datasets/wawuwaa/vi-feature-groupemow/Vi_Feature_GroupEmoW/Scene_Features_GroupEmoW_swin_tiny"
+SCENE_FEATURE_DIR      = "/kaggle/input/full-scene-features-groupemow-swin-tiny/Scene_Features_GroupEmoW_swin_tiny_patch49"
 
 OUTPUT_DIR = "/kaggle/working"
-MODEL_PATH = os.path.join(OUTPUT_DIR, "vilt_hcam_exact_paper_logic.pth")
+MODEL_PATH = os.path.join(OUTPUT_DIR, "vilt_hcam_attention_masking.pth")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -35,33 +33,41 @@ NUM_CLASSES = 3
 LABEL_MAP = {"Positive": 0, "Negative": 1, "Neutral": 2}
 INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
 
-FACE_FEAT_DIM = 384
+FACE_FEAT_DIM   = 384
 OBJECT_FEAT_DIM = 384
-SCENE_FEAT_DIM = 768
+SCENE_FEAT_DIM  = 768
+NUM_SCENE_PATCHES = 49   
 
-MAX_FACES = 10
+MAX_FACES   = 10
 MAX_OBJECTS = 14
 
-D_MODEL = 512
+D_MODEL  = 512
 NUM_HEADS = 8
-FFN_DIM = 2048
-DROPOUT = 0.4
+FFN_DIM   = 2048
+DROPOUT   = 0.4
 HEAD_DROPOUT = 0.3
 
-MASK_PROB_FACE   = 0.3
-MASK_PROB_OBJECT = 0.15
-ALPHA_MFM_FACE   = 1.0
-ALPHA_MFM_OBJECT = 0.5
+# Cân bằng Loss thủ công (Đã xóa Sparsity)
+ALPHA_MFM_START = 0.5   
+ALPHA_MFM_END   = 0.05  
 
-BATCH_SIZE = 64
-LEARNING_RATE = 5e-5
-NUM_EPOCHS = 200
-EARLY_STOP_PATIENCE = 15
-MIN_IMPROVEMENT = 0.005
+W_MFM_FACE  = 1.0   # Khuôn mặt là quan trọng nhất
+W_MFM_OBJ   = 0.5   # Vật thể hỗ trợ ngữ cảnh
+W_MFM_SCENE = 0.5   # Bối cảnh hỗ trợ không gian
 
+# Kỷ luật thép: Luôn che Top-3 token quan trọng nhất
+TOP_K_FACE = 3
+TOP_K_OBJ  = 3
+TOP_K_SCENE = 15
+
+BATCH_SIZE         = 64
+LEARNING_RATE      = 5e-5
+NUM_EPOCHS         = 200
+EARLY_STOP_PATIENCE = 20
+MIN_IMPROVEMENT    = 0.005
 
 # ==========================================
-# 2. DATASET — RAM Caching
+# 2. DATASET (Giữ nguyên)
 # ==========================================
 class MultiModalFeatureDataset(Dataset):
     def __init__(self, split):
@@ -120,8 +126,10 @@ class MultiModalFeatureDataset(Dataset):
 
             try:
                 sc = torch.tensor(np.load(s['scene']), dtype=torch.float32)
-                sc = F.normalize(sc, p=2, dim=0)
-            except: sc = torch.zeros(SCENE_FEAT_DIM)
+                assert sc.shape == (NUM_SCENE_PATCHES, SCENE_FEAT_DIM)
+                sc = F.normalize(sc, p=2, dim=-1)
+            except Exception as e:
+                sc = torch.zeros(NUM_SCENE_PATCHES, SCENE_FEAT_DIM)
 
             self.cache_faces.append(ff)
             self.cache_face_masks.append(f_mask)
@@ -131,11 +139,9 @@ class MultiModalFeatureDataset(Dataset):
             self.labels.append(s['label'])
 
     def __len__(self): return len(self.labels)
-
     def _extract_index(self, path):
         try: return int(os.path.splitext(os.path.basename(path))[0].split('_')[-1])
         except: return 9999
-
     def _load_features(self, feature_paths, max_tokens, feat_dim):
         feature_paths = sorted(feature_paths, key=self._extract_index)
         if len(feature_paths) > max_tokens: feature_paths = feature_paths[:max_tokens]
@@ -145,7 +151,6 @@ class MultiModalFeatureDataset(Dataset):
             except: continue
         if not features: return torch.zeros(1, feat_dim)
         return F.normalize(torch.stack(features), p=2, dim=-1)
-
     def __getitem__(self, idx):
         return (self.cache_faces[idx], self.cache_face_masks[idx],
                 self.cache_objs[idx], self.cache_obj_masks[idx],
@@ -157,146 +162,96 @@ def collate_fn_features(batch):
             torch.stack(objects), torch.stack(o_masks),
             torch.stack(scenes), torch.tensor(labels, dtype=torch.long))
 
+# ==========================================
+# 3. ViLT ARCHITECTURE (ATTENTION-GUIDED MASKING)
+# ==========================================
+class AttnExtractorLayer(nn.Module):
+    """Custom Transformer Layer để trích xuất Attention Weights cho việc Masking"""
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-# ==========================================
-# 3. ViLT ARCHITECTURE — HCAM EXACT PAPER LOGIC
-# ==========================================
+    def forward(self, src, src_key_padding_mask=None):
+        # Trích xuất attn_weights: shape (B, L, L)
+        src2, attn_weights = self.self_attn(src, src, src, key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src, attn_weights
 
 class ViLTWithMFM(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.face_proj   = nn.Linear(FACE_FEAT_DIM,   D_MODEL)
         self.object_proj = nn.Linear(OBJECT_FEAT_DIM, D_MODEL)
         self.scene_proj  = nn.Linear(SCENE_FEAT_DIM,  D_MODEL)
 
-        self.type_embeddings = nn.Embedding(3, D_MODEL)
-        self.register_buffer("type_ids", torch.tensor([0, 1, 2]))
-
-        self.face_pos_embed    = nn.Parameter(torch.randn(1, MAX_FACES,   D_MODEL))
-        self.obj_pos_embed     = nn.Parameter(torch.randn(1, MAX_OBJECTS, D_MODEL))
+        # Mask Tokens
         self.face_mask_token   = nn.Parameter(torch.zeros(1, 1, D_MODEL))
         self.object_mask_token = nn.Parameter(torch.zeros(1, 1, D_MODEL))
+        self.scene_mask_token  = nn.Parameter(torch.zeros(1, 1, D_MODEL))
 
-        # STAGE I: INTRA-MODALITY
-        self.face_encoder = nn.TransformerEncoderLayer(
-            d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True
-        )
-        self.obj_encoder = nn.TransformerEncoderLayer(
-            d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True
-        )
+        # --- STAGE I (Sử dụng Custom Layer để lấy Attention) ---
+        self.face_encoder = AttnExtractorLayer(D_MODEL, NUM_HEADS, FFN_DIM, DROPOUT)
+        self.obj_encoder  = AttnExtractorLayer(D_MODEL, NUM_HEADS, FFN_DIM, DROPOUT)
+        self.scene_encoder = AttnExtractorLayer(D_MODEL, NUM_HEADS, FFN_DIM, DROPOUT)
 
-        # STAGE I PREDICTORS (Chỉ có Face và Object, không có Scene)
         self.pred_f1 = nn.Sequential(nn.Dropout(HEAD_DROPOUT), nn.Linear(D_MODEL, NUM_CLASSES))
         self.pred_o1 = nn.Sequential(nn.Dropout(HEAD_DROPOUT), nn.Linear(D_MODEL, NUM_CLASSES))
 
-        # STAGE II: STRICT CROSS-ATTENTION + REFINE
+        # --- STAGE II ---
         self.face_cross  = nn.MultiheadAttention(D_MODEL, NUM_HEADS, dropout=DROPOUT, batch_first=True)
         self.obj_cross   = nn.MultiheadAttention(D_MODEL, NUM_HEADS, dropout=DROPOUT, batch_first=True)
         self.scene_cross = nn.MultiheadAttention(D_MODEL, NUM_HEADS, dropout=DROPOUT, batch_first=True)
 
-        self.face_refine = nn.TransformerEncoderLayer(
-            d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True
-        )
-        self.obj_refine = nn.TransformerEncoderLayer(
-            d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True
-        )
-        self.scene_refine = nn.Sequential(
-            nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU()
-        )
+        self.face_refine  = nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True)
+        self.obj_refine   = nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True)
+        self.scene_refine = nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=NUM_HEADS, dim_feedforward=FFN_DIM, dropout=DROPOUT, batch_first=True)
 
-        # STAGE II PREDICTORS (Chỉ có Face và Object, không có Scene)
         self.pred_f2 = nn.Sequential(nn.Dropout(HEAD_DROPOUT), nn.Linear(D_MODEL, NUM_CLASSES))
         self.pred_o2 = nn.Sequential(nn.Dropout(HEAD_DROPOUT), nn.Linear(D_MODEL, NUM_CLASSES))
 
-        # STAGE III: FINAL FUSION & PREDICTION
-        self.fc_fusion_feat = nn.Sequential(
-            nn.Linear(3 * D_MODEL, D_MODEL), 
-            nn.LayerNorm(D_MODEL), 
-            nn.GELU()
-        )
+        # --- STAGE III ---
+        self.fc_fusion_feat = nn.Sequential(nn.Linear(3 * D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU())
         self.pred_c = nn.Sequential(nn.Dropout(HEAD_DROPOUT), nn.Linear(D_MODEL, NUM_CLASSES))
 
-        # MFM HEADS
-        self.face_mfm_head = nn.Sequential(
-            nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU(), nn.Linear(D_MODEL, FACE_FEAT_DIM)
-        )
-        self.object_mfm_head = nn.Sequential(
-            nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU(), nn.Linear(D_MODEL, OBJECT_FEAT_DIM)
-        )
+        # --- MFM HEADS ---
+        self.face_mfm_head   = nn.Sequential(nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU(), nn.Linear(D_MODEL, FACE_FEAT_DIM))
+        self.object_mfm_head = nn.Sequential(nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU(), nn.Linear(D_MODEL, OBJECT_FEAT_DIM))
+        self.scene_mfm_head  = nn.Sequential(nn.Linear(D_MODEL, D_MODEL), nn.LayerNorm(D_MODEL), nn.GELU(), nn.Linear(D_MODEL, SCENE_FEAT_DIM))
+
         self._init_weights()
 
     def _init_weights(self):
         for name, p in self.named_parameters():
             if p.dim() > 1: nn.init.xavier_uniform_(p)
-        nn.init.normal_(self.type_embeddings.weight, std=0.02)
         nn.init.normal_(self.face_mask_token,   std=0.02)
         nn.init.normal_(self.object_mask_token, std=0.02)
+        nn.init.normal_(self.scene_mask_token,  std=0.02)
 
     def _masked_mean(self, seq, pad_mask):
         valid_mask = (~pad_mask).float().unsqueeze(-1)
-        sum_feat = (seq * valid_mask).sum(dim=1)
-        count = valid_mask.sum(dim=1).clamp(min=1e-6)
+        sum_feat   = (seq * valid_mask).sum(dim=1)
+        count      = valid_mask.sum(dim=1).clamp(min=1e-6)
         return sum_feat / count
 
-    def forward(self, face_feats, face_mask, object_feats, object_mask, scene_feat, masking=False):
-        B = face_feats.size(0)
-        device = face_feats.device
-
-        f_embed = self.face_proj(face_feats)
-        o_embed = self.object_proj(object_feats)
-        s_embed = self.scene_proj(scene_feat).unsqueeze(1)
-        
-        bool_masked_pos, masked_labels = None, None
-        object_bool_masked_pos, object_masked_labels = None, None
-
-        if masking:
-            rand = torch.rand(f_embed.shape[:2], device=device)
-            rand_obj = torch.rand(o_embed.shape[:2], device=device)
-            face_mask_indices = (rand < MASK_PROB_FACE) & face_mask.bool()
-            obj_mask_indices  = (rand_obj < MASK_PROB_OBJECT) & object_mask.bool()
-
-            if face_mask_indices.sum() > 0:
-                bool_masked_pos = face_mask_indices
-                masked_labels   = face_feats[face_mask_indices]
-                mask_tokens_expanded = self.face_mask_token.to(f_embed.dtype).expand(B, f_embed.size(1), -1)
-                f_embed = f_embed.clone()
-                f_embed[face_mask_indices] = mask_tokens_expanded[face_mask_indices]
-
-            if obj_mask_indices.sum() > 0:
-                object_bool_masked_pos = obj_mask_indices
-                object_masked_labels   = object_feats[obj_mask_indices]
-                obj_mask_tokens = self.object_mask_token.to(o_embed.dtype).expand(B, o_embed.size(1), -1)
-                o_embed = o_embed.clone()
-                o_embed[obj_mask_indices] = obj_mask_tokens[obj_mask_indices]
-
-        cls_input = s_embed + self.type_embeddings(self.type_ids[0])
-        f_input   = f_embed + self.face_pos_embed[:, :f_embed.size(1), :] + self.type_embeddings(self.type_ids[1])
-        o_input   = o_embed + self.obj_pos_embed[:, :o_embed.size(1), :] + self.type_embeddings(self.type_ids[2])
-
-        f_pad_mask = (face_mask == 0)
-        o_pad_mask = (object_mask == 0)
-        cls_pad_mask = torch.zeros(B, 1, device=device, dtype=torch.bool)
-
-        # STAGE I
-        f_s1 = self.face_encoder(f_input, src_key_padding_mask=f_pad_mask)
-        o_s1 = self.obj_encoder(o_input, src_key_padding_mask=o_pad_mask)
-        s_s1 = cls_input
-
-        f_pool1 = self._masked_mean(f_s1, f_pad_mask)
-        o_pool1 = self._masked_mean(o_s1, o_pad_mask)
-
-        # Chỉ có Face và Object dự đoán ở Stage 1
-        p1_f = self.pred_f1(f_pool1)
-        p1_o = self.pred_o1(o_pool1)
-
-        # STAGE II: Strict Cross-Attention
+    def _forward_clean_stage2_3(self, f_s1, f_pad_mask, o_s1, o_pad_mask, s_s1, s_pad_mask):
+        # STAGE II
         mem_f = torch.cat([s_s1, o_s1], dim=1)
-        mem_pad_mask_f = torch.cat([cls_pad_mask, o_pad_mask], dim=1)
+        mem_pad_mask_f = torch.cat([s_pad_mask, o_pad_mask], dim=1)
         f_c2, _ = self.face_cross(query=f_s1, key=mem_f, value=mem_f, key_padding_mask=mem_pad_mask_f)
 
         mem_o = torch.cat([s_s1, f_s1], dim=1)
-        mem_pad_mask_o = torch.cat([cls_pad_mask, f_pad_mask], dim=1)
+        mem_pad_mask_o = torch.cat([s_pad_mask, f_pad_mask], dim=1)
         o_c2, _ = self.obj_cross(query=o_s1, key=mem_o, value=mem_o, key_padding_mask=mem_pad_mask_o)
 
         mem_s = torch.cat([f_s1, o_s1], dim=1)
@@ -304,35 +259,132 @@ class ViLTWithMFM(nn.Module):
         s_c2, _ = self.scene_cross(query=s_s1, key=mem_s, value=mem_s, key_padding_mask=mem_pad_mask_s)
 
         f_r2 = self.face_refine(f_c2, src_key_padding_mask=f_pad_mask)
-        o_r2 = self.obj_refine(o_c2, src_key_padding_mask=o_pad_mask)
-        s_r2 = self.scene_refine(s_c2)
+        o_r2 = self.obj_refine(o_c2,  src_key_padding_mask=o_pad_mask)
+        s_r2 = self.scene_refine(s_c2, src_key_padding_mask=s_pad_mask)
 
         f_pool2 = self._masked_mean(f_r2, f_pad_mask)
         o_pool2 = self._masked_mean(o_r2, o_pad_mask)
-        s_pool2 = s_r2.squeeze(1)
+        s_pool2 = s_r2.mean(dim=1)
 
-        # Chỉ có Face và Object dự đoán ở Stage 2
         p2_f = self.pred_f2(f_pool2)
         p2_o = self.pred_o2(o_pool2)
 
-        # STAGE III: FUSION
-        fused = torch.cat([f_pool2, o_pool2, s_pool2], dim=-1)
+        # STAGE III (Chỉ gọi cho Luồng Sạch)
+        fused  = torch.cat([f_pool2, o_pool2, s_pool2], dim=-1)
         feat_c = self.fc_fusion_feat(fused)
-        
-        p_c = self.pred_c(feat_c)
+        p_c    = self.pred_c(feat_c)
 
-        logits_face_mfm, logits_object_mfm = None, None
+        return p2_f, p2_o, p_c
+
+
+    def forward(self, face_feats, face_mask, object_feats, object_mask, scene_feat, masking=False):
+        B, device = face_feats.size(0), face_feats.device
+
+        # 1. Chiếu đặc trưng
+        f_embed_raw = self.face_proj(face_feats)
+        o_embed_raw = self.object_proj(object_feats)
+        s_embed_raw = self.scene_proj(scene_feat)
+
+        f_pad_mask = (face_mask == 0)
+        o_pad_mask = (object_mask == 0)
+        s_pad_mask = torch.zeros(B, NUM_SCENE_PATCHES, device=device, dtype=torch.bool)
+
+        # ==========================================
+        # LUỒNG 1: CLEAN BRANCH (Đồng thời lấy Attention)
+        # ==========================================
+        # STAGE I
+        f_s1_clean, attn_f = self.face_encoder(f_embed_raw, f_pad_mask)
+        o_s1_clean, attn_o = self.obj_encoder(o_embed_raw, o_pad_mask)
+        s_s1_clean, attn_s = self.scene_encoder(s_embed_raw, s_pad_mask)
+
+        f_pool1 = self._masked_mean(f_s1_clean, f_pad_mask)
+        o_pool1 = self._masked_mean(o_s1_clean, o_pad_mask)
+        p1_f = self.pred_f1(f_pool1)
+        p1_o = self.pred_o1(o_pool1)
+
+        # STAGE II & III (Dự đoán thuần túy)
+        p2_f, p2_o, p_c = self._forward_clean_stage2_3(
+            f_s1_clean, f_pad_mask, o_s1_clean, o_pad_mask, s_s1_clean, s_pad_mask
+        )
+        preds_clean = (p1_f, p1_o, p2_f, p2_o, p_c)
+
+        # ==========================================
+        # LUỒNG 2: MASKED BRANCH
+        # ==========================================
+        logits_f_mfm, logits_o_mfm, logits_s_mfm = None, None, None
+        masked_labels_f, masked_labels_o, masked_labels_s = None, None, None
+
         if masking:
-            if bool_masked_pos is not None:
-                logits_face_mfm = self.face_mfm_head(f_r2[bool_masked_pos])
-            if object_bool_masked_pos is not None:
-                logits_object_mfm = self.object_mfm_head(o_r2[object_bool_masked_pos])
+            # --- TÌM TOP-K ---
+            imp_f = attn_f.sum(dim=1).masked_fill(f_pad_mask, -1e9)
+            imp_o = attn_o.sum(dim=1).masked_fill(o_pad_mask, -1e9)
+            imp_s = attn_s.sum(dim=1).masked_fill(s_pad_mask, -1e9)
 
-        # Trả về 5 predictions
-        preds = (p1_f, p1_o, p2_f, p2_o, p_c)
+            _, topk_f = torch.topk(imp_f, k=TOP_K_FACE, dim=-1)
+            _, topk_o = torch.topk(imp_o, k=TOP_K_OBJ, dim=-1)
+            _, topk_s = torch.topk(imp_s, k=TOP_K_SCENE, dim=-1)
 
-        return preds, logits_face_mfm, masked_labels, logits_object_mfm, object_masked_labels
+            # Lọc Mask an toàn
+            mask_idx_f = torch.zeros_like(imp_f, dtype=torch.bool).scatter_(1, topk_f, True) & (~f_pad_mask)
+            mask_idx_o = torch.zeros_like(imp_o, dtype=torch.bool).scatter_(1, topk_o, True) & (~o_pad_mask)
+            mask_idx_s = torch.zeros_like(imp_s, dtype=torch.bool).scatter_(1, topk_s, True) & (~s_pad_mask)
 
+            # --- TẠO QUERY BỊ MASK ---
+            f_embed_masked = f_embed_raw.clone()
+            o_embed_masked = o_embed_raw.clone()
+            s_embed_masked = s_embed_raw.clone()
+
+            if mask_idx_f.sum() > 0:
+                masked_labels_f = face_feats[mask_idx_f]
+                f_embed_masked[mask_idx_f] = self.face_mask_token.to(f_embed_masked.dtype).expand(B, MAX_FACES, -1)[mask_idx_f]
+            if mask_idx_o.sum() > 0:
+                masked_labels_o = object_feats[mask_idx_o]
+                o_embed_masked[mask_idx_o] = self.object_mask_token.to(o_embed_masked.dtype).expand(B, MAX_OBJECTS, -1)[mask_idx_o]
+            if mask_idx_s.sum() > 0:
+                masked_labels_s = scene_feat[mask_idx_s]
+                s_embed_masked[mask_idx_s] = self.scene_mask_token.to(s_embed_masked.dtype).expand(B, NUM_SCENE_PATCHES, -1)[mask_idx_s]
+
+            # Đưa Query bị Mask qua Stage 1
+            f_s1_mask, _ = self.face_encoder(f_embed_masked, f_pad_mask)
+            o_s1_mask, _ = self.obj_encoder(o_embed_masked, o_pad_mask)
+            s_s1_mask, _ = self.scene_encoder(s_embed_masked, s_pad_mask)
+
+            # --- TRÍCH XUẤT NGỮ CẢNH SẠCH (CLEAN CONTEXT) ---
+            #Chỉ lấy 15 token Top-K của Scene Sạch làm Memory
+            s_s1_clean_topk = torch.gather(s_s1_clean, 1, topk_s.unsqueeze(-1).expand(-1, -1, D_MODEL))
+            s_pad_mask_topk = torch.zeros(B, TOP_K_SCENE, device=device, dtype=torch.bool)
+
+            # --- STAGE 2 MFM  ---
+            # Query là Masked. Key/Value là clean và đã được lọc nhiễu
+            
+            # Masked Face hỏi Clean Obj và Top-15 Clean Scene
+            mem_f_clean = torch.cat([s_s1_clean_topk, o_s1_clean], dim=1)
+            mem_pad_mask_f_clean = torch.cat([s_pad_mask_topk, o_pad_mask], dim=1)
+            f_c2_m, _ = self.face_cross(query=f_s1_mask, key=mem_f_clean, value=mem_f_clean, key_padding_mask=mem_pad_mask_f_clean)
+
+            # Masked Obj hỏi Clean Face và Top-15 Clean Scene
+            mem_o_clean = torch.cat([s_s1_clean_topk, f_s1_clean], dim=1)
+            mem_pad_mask_o_clean = torch.cat([s_pad_mask_topk, f_pad_mask], dim=1)
+            o_c2_m, _ = self.obj_cross(query=o_s1_mask, key=mem_o_clean, value=mem_o_clean, key_padding_mask=mem_pad_mask_o_clean)
+
+            # Masked Scene hỏi Clean Face và Clean Obj
+            mem_s_clean = torch.cat([f_s1_clean, o_s1_clean], dim=1)
+            mem_pad_mask_s_clean = torch.cat([f_pad_mask, o_pad_mask], dim=1)
+            s_c2_m, _ = self.scene_cross(query=s_s1_mask, key=mem_s_clean, value=mem_s_clean, key_padding_mask=mem_pad_mask_s_clean)
+
+            # Refine
+            f_r2_m = self.face_refine(f_c2_m, src_key_padding_mask=f_pad_mask)
+            o_r2_m = self.obj_refine(o_c2_m,  src_key_padding_mask=o_pad_mask)
+            s_r2_m = self.scene_refine(s_c2_m, src_key_padding_mask=s_pad_mask)
+
+            # --- KHÔI PHỤC (MFM) ---
+            if mask_idx_f.sum() > 0: logits_f_mfm = self.face_mfm_head(f_r2_m[mask_idx_f])
+            if mask_idx_o.sum() > 0: logits_o_mfm = self.object_mfm_head(o_r2_m[mask_idx_o])
+            if mask_idx_s.sum() > 0: logits_s_mfm = self.scene_mfm_head(s_r2_m[mask_idx_s])
+
+        return preds_clean, (logits_f_mfm, masked_labels_f), \
+                            (logits_o_mfm, masked_labels_o), \
+                            (logits_s_mfm, masked_labels_s)
 
 # ==========================================
 # 4. LOSS FUNCTIONS
@@ -340,78 +392,98 @@ class ViLTWithMFM(nn.Module):
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.0):
         super().__init__()
-        self.gamma           = gamma
-        self.reduction       = reduction
-        self.label_smoothing = label_smoothing
-        if alpha is not None:
-            self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
+        self.gamma, self.reduction, self.label_smoothing = gamma, reduction, label_smoothing
+        if alpha is not None: self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
         else: self.alpha = None
 
     def forward(self, inputs, targets):
-        ce_loss    = F.cross_entropy(inputs, targets, reduction='none', label_smoothing=self.label_smoothing)
-        pt         = torch.exp(-ce_loss)
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', label_smoothing=self.label_smoothing)
+        pt = torch.exp(-ce_loss)
         focal_loss = (1 - pt) ** self.gamma * ce_loss
         if self.alpha is not None: focal_loss = self.alpha[targets] * focal_loss
         if self.reduction == 'mean': return focal_loss.mean()
-        elif self.reduction == 'sum': return focal_loss.sum()
-        return focal_loss
+        return focal_loss.sum()
 
+def standard_cosine_loss(pred, target):
+    if pred is None or target is None or pred.size(0) == 0:
+        return torch.tensor(0.0, device=DEVICE)
+    pred_norm = F.normalize(pred, p=2, dim=-1)
+    return (1.0 - F.cosine_similarity(pred_norm, target, dim=-1)).mean()
 
 # ==========================================
 # 5. TRAINING & EVALUATION LOOPS
 # ==========================================
-def train_epoch(model, loader, criterion_cls, criterion_mfm, optimizer):
+def train_epoch(model, loader, criterion_cls, optimizer, current_alpha_mfm):
     model.train()
-    total_loss = total_cls = total_face_mfm = total_obj_mfm = 0
+    # Biến tích lũy cho Tổng và MFM
+    total_loss = total_cls = total_mfm = 0
+    total_f_mfm = total_o_mfm = total_s_mfm = 0
+    
+    # Biến tích lũy cho 5 đầu Classification
+    total_l1_f = total_l1_o = total_l2_f = total_l2_o = total_l_c = 0
+    
     correct = total = 0
     scaler  = torch.amp.GradScaler('cuda')
 
     for batch in tqdm(loader, desc="Training"):
         faces, f_mask, objects, o_mask, scene, labels = [b.to(DEVICE) for b in batch]
-
         optimizer.zero_grad()
+        
         with torch.amp.autocast(device_type='cuda'):
-            preds, face_mfm_pred, face_mfm_targets, obj_mfm_pred, obj_mfm_targets = model(
+            preds, (f_pred, f_tgt), (o_pred, o_tgt), (s_pred, s_tgt) = model(
                 faces, f_mask, objects, o_mask, scene, masking=True
             )
             p1_f, p1_o, p2_f, p2_o, p_c = preds
 
-            # 1. HCAM Loss: SIMPLE SUM (Không dùng weight)
-            loss_cls = (
-                criterion_cls(p1_f, labels) +
-                criterion_cls(p1_o, labels) +
-                criterion_cls(p2_f, labels) +
-                criterion_cls(p2_o, labels) +
-                criterion_cls(p_c, labels)
-            )
-            
-            # 2. MSE MFM
-            loss_face_mfm = torch.tensor(0.0, device=DEVICE)
-            loss_obj_mfm  = torch.tensor(0.0, device=DEVICE)
-            if face_mfm_pred is not None and face_mfm_targets is not None:
-                loss_face_mfm = criterion_mfm(face_mfm_pred, face_mfm_targets)
-            if obj_mfm_pred is not None and obj_mfm_targets is not None:
-                loss_obj_mfm  = criterion_mfm(obj_mfm_pred,  obj_mfm_targets)
+            # 1. Classification Loss (Tách riêng từng đầu)
+            l1_f = criterion_cls(p1_f, labels)
+            l1_o = criterion_cls(p1_o, labels)
+            l2_f = criterion_cls(p2_f, labels)
+            l2_o = criterion_cls(p2_o, labels)
+            l_c  = criterion_cls(p_c, labels)
 
-            loss = loss_cls + ALPHA_MFM_FACE * loss_face_mfm + ALPHA_MFM_OBJECT * loss_obj_mfm
+            loss_cls = l1_f + l1_o + l2_f + l2_o + l_c
+
+            # 2. MFM Loss (Tách riêng)
+            loss_f_raw = standard_cosine_loss(f_pred, f_tgt)
+            loss_o_raw = standard_cosine_loss(o_pred, o_tgt)
+            loss_s_raw = standard_cosine_loss(s_pred, s_tgt)
+            
+            # Gộp MFM Loss với trọng số (Bạn tự set W_MFM_* ở phần Config nhé)
+            loss_mfm = (W_MFM_FACE * loss_f_raw) + (W_MFM_OBJ * loss_o_raw) + (W_MFM_SCENE * loss_s_raw)
+
+            # 3. TỔNG LOSS
+            loss = loss_cls + current_alpha_mfm * loss_mfm
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss     += loss.item()
-        total_cls      += loss_cls.item()
-        total_face_mfm += loss_face_mfm.item()
-        total_obj_mfm  += loss_obj_mfm.item()
+        # Tích lũy để tính trung bình
+        total_loss += loss.item()
+        total_cls  += loss_cls.item()
+        total_mfm  += loss_mfm.item()
+        
+        total_f_mfm += loss_f_raw.item()
+        total_o_mfm += loss_o_raw.item()
+        total_s_mfm += loss_s_raw.item()
 
-        # Trong Training, chỉ dùng bộ phân loại Fusion chính (p_c) để track Accuracy
-        # (Không dùng ensemble trong training theo đúng paper)
+        total_l1_f += l1_f.item()
+        total_l1_o += l1_o.item()
+        total_l2_f += l2_f.item()
+        total_l2_o += l2_o.item()
+        total_l_c  += l_c.item()
+
         _, pred = torch.max(p_c, 1)
         correct += (pred == labels).sum().item()
         total   += labels.size(0)
 
     n = len(loader)
-    print(f"  CLS(Sum_5_Heads)={total_cls/n:.4f} | FaceMFM={total_face_mfm/n:.4f} | ObjMFM={total_obj_mfm/n:.4f}")
+    # IN RA MÀN HÌNH LOG CHI TIẾT
+    print(f"  [Losses Tổng] CLS={total_cls/n:.4f} | MFM={total_mfm/n:.4f} | TỔNG={total_loss/n:.4f}")
+    print(f"  [Chi tiết CLS] L1_F={total_l1_f/n:.4f} | L1_O={total_l1_o/n:.4f} | L2_F={total_l2_f/n:.4f} | L2_O={total_l2_o/n:.4f} | L_C={total_l_c/n:.4f}")
+    print(f"  [Chi tiết MFM] Face={total_f_mfm/n:.4f} | Obj={total_o_mfm/n:.4f} | Scene={total_s_mfm/n:.4f}")
+    
     return total_cls / n, 100 * correct / total
 
 def eval_epoch(model, loader, criterion):
@@ -419,47 +491,19 @@ def eval_epoch(model, loader, criterion):
     total_loss = correct = total = 0
     all_preds, all_labels = [], []
 
-    # Tham số Ensemble HCAM (Eq 9, 10, 11)
-    ALPHA_STAGE1_TO_2 = 0.4
-    ALPHA_FUSION = 0.5
-    ALPHA_FACE = 0.25
-    ALPHA_OBJ = 0.25
-
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
             faces, f_mask, objects, o_mask, scene, labels = [b.to(DEVICE) for b in batch]
-            
-            preds, _, _, _, _ = model(faces, f_mask, objects, o_mask, scene, masking=False)
-            p1_f, p1_o, p2_f, p2_o, p_c = preds
-            
-            # --- BƯỚC 1: CHUYỂN TOÀN BỘ LOGITS THÀNH PROBABILITIES ---
-            prob1_f = F.softmax(p1_f, dim=1)
-            prob1_o = F.softmax(p1_o, dim=1)
-            prob2_f = F.softmax(p2_f, dim=1)
-            prob2_o = F.softmax(p2_o, dim=1)
-            prob_c  = F.softmax(p_c, dim=1)
-            
-            # --- BƯỚC 2: HCAM INFERENCE ENSEMBLE (TRÊN KHÔNG GIAN XÁC SUẤT) ---
-            # Combine Stage 1 và Stage 2 cho từng modality
-            y2_f_prob = (1 - ALPHA_STAGE1_TO_2) * prob2_f + ALPHA_STAGE1_TO_2 * prob1_f
-            y2_o_prob = (1 - ALPHA_STAGE1_TO_2) * prob2_o + ALPHA_STAGE1_TO_2 * prob1_o
-            
-            # Combine tất cả vào Probabilities cuối cùng
-            p_final = ALPHA_FUSION * prob_c + ALPHA_FACE * y2_f_prob + ALPHA_OBJ * y2_o_prob
-            
-            # --- BƯỚC 3: TÍNH LOSS VÀ ACCURACY ---
-            # Vì criterion_cls (FocalLoss) mong đợi logits, ta bọc log() quanh p_final
-            # để hàm CrossEntropy bên trong tự triệt tiêu và tính ra chính xác giá trị toán học
-            loss_logits = torch.log(p_final + 1e-8)
-            loss        = criterion(loss_logits, labels)
-            
+            preds, _, _, _ = model(faces, f_mask, objects, o_mask, scene, masking=False)
+            _, _, _, _, p_c = preds
+
+            loss = criterion(p_c, labels)
             total_loss += loss.item()
             
-            # Lấy class có xác suất cao nhất
-            _, pred     = torch.max(p_final, 1)
-            correct    += (pred == labels).sum().item()
-            total      += labels.size(0)
-            
+            _, pred = torch.max(p_c, 1)
+            correct += (pred == labels).sum().item()
+            total   += labels.size(0)
+
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -477,26 +521,24 @@ def plot_confusion_matrix(labels_true, preds, save_dir):
     plt.title("Confusion Matrix (Normalized)")
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
-    path = os.path.join(save_dir, "confusion_matrix.png")
     plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    plt.savefig(os.path.join(save_dir, "confusion_matrix.png"), dpi=150)
     plt.close()
 
 def plot_training_history(train_losses, val_losses, train_accs, val_accs, save_dir):
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss (Sum of 5)')
-    plt.plot(val_losses,   label='Val Loss (Ensemble)')
+    plt.plot(train_losses, label='Train Loss (CLS)')
+    plt.plot(val_losses,   label='Val Loss (CLS)')
     plt.legend()
     plt.title('Classification Loss')
     plt.subplot(1, 2, 2)
-    plt.plot(train_accs, label='Train Acc (Fusion Head)')
-    plt.plot(val_accs,   label='Val Acc (Ensemble)')
+    plt.plot(train_accs, label='Train Acc')
+    plt.plot(val_accs,   label='Val Acc')
     plt.legend()
     plt.title('Accuracy (%)')
-    path = os.path.join(save_dir, "training_history.png")
     plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    plt.savefig(os.path.join(save_dir, "training_history.png"), dpi=150)
     plt.close()
 
 # ==========================================
@@ -504,25 +546,23 @@ def plot_training_history(train_losses, val_losses, train_accs, val_accs, save_d
 # ==========================================
 if __name__ == "__main__":
     print("\n" + "=" * 65)
-    print("  ViLT - EXACT HCAM (Simple Sum Loss, Inference Ensemble)")
+    print("  ViLT - ATTENTION-GUIDED HARD MASKING (XAI APPROACH)")
     print("=" * 65)
 
     train_ds = MultiModalFeatureDataset('train')
     val_ds   = MultiModalFeatureDataset('val')
     test_ds  = MultiModalFeatureDataset('test')
 
-    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, collate_fn=collate_fn_features, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,  collate_fn=collate_fn_features, num_workers=0, pin_memory=True)
     val_loader   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, collate_fn=collate_fn_features, num_workers=0, pin_memory=True)
     test_loader  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False, collate_fn=collate_fn_features, num_workers=0, pin_memory=True)
 
-    print(f"\nInitializing ViLTWithMFM (Exact HCAM Paper Logic)...")
+    print(f"\nInitializing Model...")
     model = ViLTWithMFM().to(DEVICE)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable parameters: {total_params:,}")
+    print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     class_weights = torch.tensor([1.0, 1.2, 1.5]).to(DEVICE)
     criterion_cls = FocalLoss(alpha=class_weights, gamma=2.0, label_smoothing=0.1)
-    criterion_mfm = nn.MSELoss()
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
@@ -533,12 +573,14 @@ if __name__ == "__main__":
     train_losses, val_losses, train_accs, val_accs = [], [], [], []
 
     for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-        t_loss, t_acc = train_epoch(model, train_loader, criterion_cls, criterion_mfm, optimizer)
+        current_alpha_mfm = ALPHA_MFM_START - (ALPHA_MFM_START - ALPHA_MFM_END) * (epoch / NUM_EPOCHS)
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} | Alpha MFM: {current_alpha_mfm:.4f}")
+        
+        t_loss, t_acc = train_epoch(model, train_loader, criterion_cls, optimizer, current_alpha_mfm)
         v_loss, v_acc, _, _ = eval_epoch(model, val_loader, criterion_cls)
 
         train_losses.append(t_loss); val_losses.append(v_loss)
-        train_accs.append(t_acc); val_accs.append(v_acc)
+        train_accs.append(t_acc);   val_accs.append(v_acc)
         scheduler.step(v_loss)
 
         print(f"  Train → Loss {t_loss:.4f}  Acc {t_acc:.2f}%  |  Val → Loss {v_loss:.4f}  Acc {v_acc:.2f}%")
